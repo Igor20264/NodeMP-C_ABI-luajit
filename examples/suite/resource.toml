@@ -1,0 +1,9 @@
+name = "suite-luajit"
+version = "1.0"
+type = "luajit-v2"
+
+# /suite start | stop | status
+# Спавна нет. Один ресурс suite за раз.
+
+[server]
+main = "server/main.lua"

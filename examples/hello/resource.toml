@@ -1,6 +1,6 @@
 name = "hello-jit"
 version = "1.0"
-type = "luajit"
+type = "luajit-v2"
 
 [server]
 main = "server/main.lua"

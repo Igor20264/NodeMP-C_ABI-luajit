@@ -1,9 +1,10 @@
-/* NodeMP language host for LuaJIT.
+/* NodeMP language host LuaJIT-v2.
  *
- * type = "luajit" runs in an embedded LuaJIT state. Callbacks stay on the
- * server worker. node.job runs on one thread pinned to its own core.
- * One lock covers every state, so a long job stalls other LuaJIT callbacks
- * and leaves the server's own Lua free.
+ * type = "luajit-v2" (and the alias "luajit") runs in an embedded LuaJIT
+ * state. Callbacks stay on the server worker. node.job runs on one thread
+ * pinned to its own core. A job with no outer locals is dumped and run in
+ * the lane's own state, so the worker does not wait on the VM lock. A job
+ * that closes over locals still runs under that lock, in the resource state.
  */
 
 #if defined(__linux__)
@@ -59,6 +60,7 @@ static long g_stop;
 typedef struct Res {
     int used;
     int alive;
+    int trusted;
     char name[96];
     lua_State *L;
 } Res;
@@ -77,6 +79,12 @@ typedef struct Job {
     int fn;
     int arg;
     int done;
+    int fast;
+    int trusted;
+    char *code;
+    size_t code_n;
+    char *argb;
+    size_t argb_n;
     struct Job *next;
 } Job;
 
@@ -85,7 +93,10 @@ typedef struct Done {
     int done;
     int result;
     int ok;
+    int fast;
     char *error;
+    char *blob;
+    size_t blob_n;
     struct Done *next;
 } Done;
 
@@ -136,6 +147,9 @@ static unsigned long long g_reserve_log_at;
 static Done *g_done_head;
 static Done *g_done_tail;
 static int g_done_armed;
+static lua_State *g_lane_L;
+static int g_safe_ref;
+static int g_full_ref;
 
 #if defined(_WIN32)
 static CRITICAL_SECTION g_vm;
@@ -161,7 +175,7 @@ static long g_lane_os_id;
 
 static void log_jit(const char *msg) {
     if (!g_api || !msg) return;
-    if (g_api->log_custom) g_api->log_custom("LuaJIT", 0xC4A35Au, msg);
+    if (g_api->log_custom) g_api->log_custom("LuaJIT-v2", 0xC4A35Au, msg);
     else if (g_api->log_info) g_api->log_info(msg);
 }
 
@@ -380,9 +394,9 @@ static void name_this_thread(void) {
     typedef HRESULT(WINAPI * SetThreadDescriptionFn)(HANDLE, PCWSTR);
     HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
     SetThreadDescriptionFn fn = kernel ? (SetThreadDescriptionFn)GetProcAddress(kernel, "SetThreadDescription") : NULL;
-    if (fn) fn(GetCurrentThread(), L"nodemp-luajit");
+    if (fn) fn(GetCurrentThread(), L"nodemp-luajit-v2");
 #else
-    pthread_setname_np(pthread_self(), "nodemp-luajit");
+    pthread_setname_np(pthread_self(), "nodemp-ljit-v2");
 #endif
 }
 
@@ -624,6 +638,299 @@ static void on_timer(int timer_id, void *user) {
     vm_unlock();
 }
 
+#define BLOB_MAX (1024 * 1024)
+#define PACK_DEPTH 16
+
+typedef struct Buf {
+    char *p;
+    size_t n;
+    size_t cap;
+} Buf;
+
+static void buf_free(Buf *b) {
+    free(b->p);
+    b->p = NULL;
+    b->n = 0;
+    b->cap = 0;
+}
+
+static int buf_add(Buf *b, const void *src, size_t n) {
+    char *grown;
+    size_t cap;
+    if (n > BLOB_MAX || b->n > BLOB_MAX - n) return -1;
+    if (b->n + n > b->cap) {
+        cap = b->cap ? b->cap * 2 : 64;
+        while (cap < b->n + n) {
+            if (cap > BLOB_MAX / 2) return -1;
+            cap *= 2;
+        }
+        grown = (char *)realloc(b->p, cap);
+        if (!grown) return -1;
+        b->p = grown;
+        b->cap = cap;
+    }
+    if (n && src) memcpy(b->p + b->n, src, n);
+    b->n += n;
+    return 0;
+}
+
+static int buf_byte(Buf *b, unsigned char c) {
+    return buf_add(b, &c, 1);
+}
+
+static int abs_index(lua_State *L, int idx) {
+    if (idx > 0 || idx <= LUA_REGISTRYINDEX) return idx;
+    return lua_gettop(L) + idx + 1;
+}
+
+static int pack_one(lua_State *L, int idx, int seen, Buf *b, int depth);
+
+static int pack_root(lua_State *L, int idx, Buf *b) {
+    int seen;
+    int top;
+    int rc;
+    idx = abs_index(L, idx);
+    top = lua_gettop(L);
+    lua_newtable(L);
+    seen = lua_gettop(L);
+    rc = pack_one(L, idx, seen, b, 0);
+    lua_settop(L, top);
+    if (rc != 0) buf_free(b);
+    return rc;
+}
+
+static int pack_one(lua_State *L, int idx, int seen, Buf *b, int depth) {
+    int type = lua_type(L, idx);
+    if (type == LUA_TNIL) return buf_byte(b, 1);
+    if (type == LUA_TBOOLEAN) return buf_byte(b, lua_toboolean(L, idx) ? 3 : 2);
+    if (type == LUA_TNUMBER) {
+        double num = lua_tonumber(L, idx);
+        if (buf_byte(b, 4) != 0) return -1;
+        return buf_add(b, &num, sizeof num);
+    }
+    if (type == LUA_TSTRING) {
+        size_t len = 0;
+        const char *text = lua_tolstring(L, idx, &len);
+        uint32_t n;
+        if (!text || len > BLOB_MAX) return -1;
+        n = (uint32_t)len;
+        if (buf_byte(b, 5) != 0 || buf_add(b, &n, sizeof n) != 0) return -1;
+        return buf_add(b, text, len);
+    }
+    if (type != LUA_TTABLE || depth >= PACK_DEPTH) return -1;
+    lua_pushvalue(L, idx);
+    lua_rawget(L, seen);
+    if (!lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return -1;
+    }
+    lua_pop(L, 1);
+    lua_pushvalue(L, idx);
+    lua_pushboolean(L, 1);
+    lua_rawset(L, seen);
+    {
+        uint32_t count = 0;
+        lua_pushnil(L);
+        while (lua_next(L, idx) != 0) {
+            if (count == 1000000u) {
+                lua_pop(L, 2);
+                return -1;
+            }
+            count++;
+            lua_pop(L, 1);
+        }
+        if (buf_byte(b, 6) != 0 || buf_add(b, &count, sizeof count) != 0) return -1;
+        lua_pushnil(L);
+        while (lua_next(L, idx) != 0) {
+            if (pack_one(L, lua_gettop(L) - 1, seen, b, depth + 1) != 0) {
+                lua_pop(L, 2);
+                return -1;
+            }
+            if (pack_one(L, lua_gettop(L), seen, b, depth + 1) != 0) {
+                lua_pop(L, 2);
+                return -1;
+            }
+            lua_pop(L, 1);
+        }
+    }
+    return 0;
+}
+
+static int unpack_one(lua_State *L, const char **p, const char *end, int depth) {
+    unsigned char tag;
+    if (*p >= end) return -1;
+    tag = (unsigned char)*(*p)++;
+    if (tag == 1) {
+        lua_pushnil(L);
+        return 0;
+    }
+    if (tag == 2) {
+        lua_pushboolean(L, 0);
+        return 0;
+    }
+    if (tag == 3) {
+        lua_pushboolean(L, 1);
+        return 0;
+    }
+    if (tag == 4) {
+        double num;
+        if ((size_t)(end - *p) < sizeof num) return -1;
+        memcpy(&num, *p, sizeof num);
+        *p += sizeof num;
+        lua_pushnumber(L, num);
+        return 0;
+    }
+    if (tag == 5) {
+        uint32_t n;
+        if ((size_t)(end - *p) < sizeof n) return -1;
+        memcpy(&n, *p, sizeof n);
+        *p += sizeof n;
+        if ((size_t)(end - *p) < n) return -1;
+        lua_pushlstring(L, *p, n);
+        *p += n;
+        return 0;
+    }
+    if (tag != 6 || depth >= PACK_DEPTH) return -1;
+    {
+        uint32_t n;
+        uint32_t i;
+        int table;
+        if ((size_t)(end - *p) < sizeof n) return -1;
+        memcpy(&n, *p, sizeof n);
+        *p += sizeof n;
+        lua_newtable(L);
+        table = lua_gettop(L);
+        for (i = 0; i < n; i++) {
+            if (unpack_one(L, p, end, depth + 1) != 0) return -1;
+            if (unpack_one(L, p, end, depth + 1) != 0) return -1;
+            lua_rawset(L, table);
+        }
+    }
+    return 0;
+}
+
+static int unpack_root(lua_State *L, const char *bytes, size_t n) {
+    const char *p;
+    const char *end;
+    int top;
+    if (!bytes || n == 0) return -1;
+    p = bytes;
+    end = bytes + n;
+    top = lua_gettop(L);
+    if (unpack_one(L, &p, end, 0) != 0 || p != end) {
+        lua_settop(L, top);
+        return -1;
+    }
+    return 0;
+}
+
+static int dump_writer(lua_State *L, const void *p, size_t sz, void *ud) {
+    (void)L;
+    return buf_add((Buf *)ud, p, sz) == 0 ? 0 : 1;
+}
+
+static int fn_is_plain(lua_State *L, int idx) {
+    lua_Debug ar;
+    if (lua_iscfunction(L, idx) || lua_type(L, idx) != LUA_TFUNCTION) return 0;
+    memset(&ar, 0, sizeof ar);
+    lua_pushvalue(L, idx);
+    if (!lua_getinfo(L, ">u", &ar)) return 0;
+    return ar.nups == 0;
+}
+
+static int job_take_fast(lua_State *L, Job *job) {
+    Buf code;
+    Buf arg;
+    memset(&code, 0, sizeof code);
+    memset(&arg, 0, sizeof arg);
+    if (!fn_is_plain(L, 1)) return -1;
+    lua_pushvalue(L, 1);
+    if (lua_dump(L, dump_writer, &code) != 0 || code.n == 0) {
+        lua_pop(L, 1);
+        buf_free(&code);
+        return -1;
+    }
+    lua_pop(L, 1);
+    if (!lua_isnoneornil(L, 2) && pack_root(L, 2, &arg) != 0) {
+        buf_free(&code);
+        return -1;
+    }
+    job->fast = 1;
+    job->code = code.p;
+    job->code_n = code.n;
+    job->argb = arg.p;
+    job->argb_n = arg.n;
+    return 0;
+}
+
+static int l_node_blocked(lua_State *L) {
+    (void)L;
+    return luaL_error(L, "node is not available in a luajit-v2 background job");
+}
+
+static void install_node_stub(lua_State *L) {
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_pushcfunction(L, l_node_blocked);
+    lua_setfield(L, -2, "__index");
+    lua_pushcfunction(L, l_node_blocked);
+    lua_setfield(L, -2, "__newindex");
+    lua_setmetatable(L, -2);
+    lua_setglobal(L, "node");
+}
+
+static void copy_global(lua_State *L, int dst, const char *name) {
+    lua_getglobal(L, name);
+    lua_setfield(L, dst, name);
+}
+
+static void build_envs(lua_State *L) {
+    static const char *const names[] = {
+        "assert", "error", "ipairs", "next", "pairs", "pcall", "xpcall", "select",
+        "tonumber", "tostring", "type", "unpack", "setmetatable", "getmetatable",
+        "rawget", "rawset", "rawequal", "collectgarbage", NULL
+    };
+    int i;
+    int safe;
+    lua_pushvalue(L, LUA_GLOBALSINDEX);
+    g_full_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_newtable(L);
+    safe = lua_gettop(L);
+    for (i = 0; names[i]; i++) copy_global(L, safe, names[i]);
+    copy_global(L, safe, "math");
+    copy_global(L, safe, "string");
+    copy_global(L, safe, "table");
+    copy_global(L, safe, "coroutine");
+    copy_global(L, safe, "bit");
+    copy_global(L, safe, "jit");
+    copy_global(L, safe, "node");
+    lua_newtable(L);
+    lua_getglobal(L, "os");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "clock");
+        lua_setfield(L, -3, "clock");
+        lua_getfield(L, -1, "time");
+        lua_setfield(L, -3, "time");
+        lua_getfield(L, -1, "difftime");
+        lua_setfield(L, -3, "difftime");
+        lua_getfield(L, -1, "date");
+        lua_setfield(L, -3, "date");
+    }
+    lua_pop(L, 1);
+    lua_setfield(L, safe, "os");
+    g_safe_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+}
+
+static void push_env(lua_State *L, int trusted) {
+    int ref = trusted ? g_full_ref : g_safe_ref;
+    lua_newtable(L);
+    if (ref == 0) return;
+    lua_newtable(L);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+    lua_setfield(L, -2, "__index");
+    lua_setmetatable(L, -2);
+}
+
 static void deliver_done(int timer_id, void *user) {
     Done *list;
     Done *item;
@@ -651,10 +958,19 @@ static void deliver_done(int timer_id, void *user) {
             lua_State *L = res->L;
             lua_settop(L, 0);
             if (item->done != LUA_NOREF) {
+                const char *err = item->error;
                 lua_rawgeti(L, LUA_REGISTRYINDEX, item->done);
-                if (item->ok && item->result != LUA_NOREF) lua_rawgeti(L, LUA_REGISTRYINDEX, item->result);
-                else lua_pushnil(L);
-                if (item->error) lua_pushstring(L, item->error);
+                if (item->fast) {
+                    if (!(item->ok && unpack_root(L, item->blob, item->blob_n) == 0)) {
+                        lua_pushnil(L);
+                        if (item->ok && !err) err = "job result cannot cross back";
+                    }
+                } else if (item->ok && item->result != LUA_NOREF) {
+                    lua_rawgeti(L, LUA_REGISTRYINDEX, item->result);
+                } else {
+                    lua_pushnil(L);
+                }
+                if (err) lua_pushstring(L, err);
                 else lua_pushnil(L);
                 if (lua_pcall(L, 2, 0, 0) != 0) {
                     const char *text = lua_tostring(L, -1);
@@ -668,6 +984,7 @@ static void deliver_done(int timer_id, void *user) {
             if (item->result != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, item->result);
             lua_settop(L, 0);
         }
+        free(item->blob);
         free(item->error);
         free(item);
         item = next;
@@ -697,7 +1014,63 @@ static void arm_done(Done *done) {
     if (arm && g_api && g_api->set_timeout) g_api->set_timeout(0, deliver_done, NULL);
 }
 
-static void run_job(Job *job) {
+static void run_job_fast(Job *job) {
+    lua_State *L = g_lane_L;
+    Done *done;
+    Buf out;
+    char errbuf[256];
+    const char *err = NULL;
+    memset(&out, 0, sizeof out);
+    errbuf[0] = '\0';
+    done = (Done *)calloc(1, sizeof *done);
+    if (!done) {
+        free(job->code);
+        free(job->argb);
+        return;
+    }
+    done->res = job->res;
+    done->done = job->done;
+    done->result = LUA_NOREF;
+    done->fast = 1;
+    if (!L) {
+        err = "lane state is missing";
+    } else {
+        lua_settop(L, 0);
+        if (luaL_loadbuffer(L, job->code, job->code_n, "node.job") != 0) {
+            err = lua_tostring(L, -1);
+        } else {
+            push_env(L, job->trusted);
+            if (!lua_setfenv(L, -2)) err = "job environment was refused";
+            else if (job->argb && job->argb_n && unpack_root(L, job->argb, job->argb_n) != 0) {
+                err = "job argument cannot cross to the lane";
+            } else {
+                if (!(job->argb && job->argb_n)) lua_pushnil(L);
+                if (lua_pcall(L, 1, 1, 0) != 0) err = lua_tostring(L, -1);
+                else if (pack_root(L, -1, &out) != 0) err = "job result cannot cross back";
+                else {
+                    done->ok = 1;
+                    done->blob = out.p;
+                    done->blob_n = out.n;
+                    out.p = NULL;
+                }
+            }
+        }
+        if (!done->ok) {
+            snprintf(errbuf, sizeof errbuf, "%s", err ? err : "lua error");
+            err = errbuf;
+        }
+        lua_settop(L, 0);
+    }
+    if (!done->ok) done->error = strdup(err ? err : "lua error");
+    buf_free(&out);
+    free(job->code);
+    free(job->argb);
+    job->code = NULL;
+    job->argb = NULL;
+    arm_done(done);
+}
+
+static void run_job_locked(Job *job) {
     Res *res;
     lua_State *L;
     Done *done;
@@ -741,6 +1114,11 @@ static void run_job(Job *job) {
     arm_done(done);
 }
 
+static void run_job(Job *job) {
+    if (job->fast) run_job_fast(job);
+    else run_job_locked(job);
+}
+
 #if defined(_WIN32)
 static unsigned __stdcall lane_main(void *arg) {
 #else
@@ -749,6 +1127,14 @@ static void *lane_main(void *arg) {
     (void)arg;
     pin_this_thread();
     name_this_thread();
+    g_lane_L = luaL_newstate();
+    if (!g_lane_L) log_err("luajit-v2 lane state failed");
+    else {
+        luaL_openlibs(g_lane_L);
+        install_node_stub(g_lane_L);
+        build_envs(g_lane_L);
+        lua_settop(g_lane_L, 0);
+    }
 #if defined(_WIN32)
     g_lane_tid = GetCurrentThreadId();
 #elif defined(__linux__)
@@ -783,6 +1169,10 @@ static void *lane_main(void *arg) {
     }
     g_lane_up = 0;
     q_unlock();
+    if (g_lane_L) {
+        lua_close(g_lane_L);
+        g_lane_L = NULL;
+    }
 #if defined(_WIN32)
     return 0;
 #else
@@ -916,24 +1306,30 @@ static int l_job(lua_State *L) {
     job = (Job *)calloc(1, sizeof *job);
     if (!job) return luaL_error(L, "out of memory");
     job->res = (int)(res - g_res);
+    job->fn = LUA_NOREF;
     job->arg = LUA_NOREF;
     job->done = LUA_NOREF;
-    lua_pushvalue(L, 1);
-    job->fn = luaL_ref(L, LUA_REGISTRYINDEX);
-    if (!lua_isnoneornil(L, 2)) {
-        lua_pushvalue(L, 2);
-        job->arg = luaL_ref(L, LUA_REGISTRYINDEX);
-    }
+    job->trusted = res->trusted;
     if (lua_isfunction(L, 3)) {
         lua_pushvalue(L, 3);
         job->done = luaL_ref(L, LUA_REGISTRYINDEX);
     }
+    if (job_take_fast(L, job) != 0) {
+        lua_pushvalue(L, 1);
+        job->fn = luaL_ref(L, LUA_REGISTRYINDEX);
+        if (!lua_isnoneornil(L, 2)) {
+            lua_pushvalue(L, 2);
+            job->arg = luaL_ref(L, LUA_REGISTRYINDEX);
+        }
+    }
     if (enqueue(job) != 0) {
-        luaL_unref(L, LUA_REGISTRYINDEX, job->fn);
+        if (job->fn != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, job->fn);
         if (job->arg != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, job->arg);
         if (job->done != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, job->done);
+        free(job->code);
+        free(job->argb);
         free(job);
-        return luaL_error(L, "luajit core lane is not accepting jobs");
+        return luaL_error(L, "luajit-v2 core lane is not accepting jobs");
     }
     return 0;
 }
@@ -1068,7 +1464,7 @@ static int l_delete(lua_State *L) {
 }
 
 static int l_version(lua_State *L) {
-    lua_pushstring(L, LUAJIT_VERSION);
+    lua_pushfstring(L, "%s luajit-v2", LUAJIT_VERSION);
     return 1;
 }
 
@@ -1250,6 +1646,7 @@ static int host_load(const char *name, const char *dir, const char *entry, void 
     lua_setglobal(L, "resource");
     res->used = 1;
     res->alive = 1;
+    res->trusted = trust;
     res->L = L;
     snprintf(res->name, sizeof res->name, "%s", name);
     if (luaL_loadbuffer(L, source, length, path) != 0 || lua_pcall(L, 0, 0, 0) != 0) {
@@ -1284,6 +1681,8 @@ static void drop_jobs(int index) {
             else g_head = next;
             if (g_tail == job) g_tail = prev;
             g_count--;
+            free(job->code);
+            free(job->argb);
             free(job);
         } else {
             prev = job;
@@ -1339,7 +1738,7 @@ static int start_lane(void) {
     while (!g_lane_up && !STOP_GET()) q_wait_ms(1000);
     q_unlock();
     snprintf(banner, sizeof banner,
-        "resources with type = \"luajit\" run on %s; background lane is pinned to core %d",
+        "luajit-v2 on %s; plain jobs run in their own state; pinned to core %d",
         LUAJIT_VERSION, g_core);
     log_jit(banner);
     return g_lane_up ? 0 : -1;
@@ -1347,8 +1746,18 @@ static int start_lane(void) {
 
 NODE_PLUGIN_ABI()
 
+static int register_host(const NodeApi *api, NodeLanguageHost *host, const char *type_name) {
+    memset(host, 0, sizeof *host);
+    host->struct_size = (uint32_t)sizeof *host;
+    host->type_name = type_name;
+    host->load = host_load;
+    host->unload = host_unload;
+    return api->register_language_host(host);
+}
+
 NODE_EXPORT int node_plugin_init(const NodeApi *api) {
-    static NodeLanguageHost host;
+    static NodeLanguageHost host_v2;
+    static NodeLanguageHost host_alias;
     g_api = api;
     if (!api || (api->abi_version >> 16) != NODE_ABI_VERSION_MAJOR) return -1;
     if (api->struct_size < (uint32_t)(offsetof(NodeApi, register_language_host) + sizeof(void *))) {
@@ -1356,17 +1765,15 @@ NODE_EXPORT int node_plugin_init(const NodeApi *api) {
         return -1;
     }
     if (start_lane() != 0) {
-        log_err("luajit lane did not start");
+        log_err("luajit-v2 lane did not start");
         return -1;
     }
-    memset(&host, 0, sizeof host);
-    host.struct_size = (uint32_t)sizeof host;
-    host.type_name = "luajit";
-    host.load = host_load;
-    host.unload = host_unload;
-    if (api->register_language_host(&host) != 0) {
-        log_err("type \"luajit\" is already taken");
+    if (register_host(api, &host_v2, "luajit-v2") != 0) {
+        log_err("type \"luajit-v2\" is already taken");
         return -1;
+    }
+    if (register_host(api, &host_alias, "luajit") != 0) {
+        log_err("type \"luajit\" is already taken; luajit-v2 is still registered");
     }
     return 0;
 }
